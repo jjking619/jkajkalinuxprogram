@@ -1,0 +1,208 @@
+#include <stdio.h>
+#include <string.h>
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+#include <unistd.h>
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+
+#include "v4l2camera.h"
+
+int LED_fs[3];
+int BEEP_fd[2];
+int DS18B20_fd;
+
+int Device_Open();
+
+void handle_device(int sid);
+
+int main()
+{
+    int device_sid = socket(AF_INET, SOCK_STREAM, 0);
+    int camera_sid = socket(AF_INET, SOCK_STREAM, 0);
+
+    struct sockaddr_in ipv4_device;
+    ipv4_device.sin_addr.s_addr = 0;
+    ipv4_device.sin_family = AF_INET;
+    ipv4_device.sin_port = htons(10001); // 设备端口号
+
+    struct sockaddr_in ipv4_camera;
+    ipv4_camera.sin_addr.s_addr = 0;
+    ipv4_camera.sin_family = AF_INET;
+    ipv4_camera.sin_port = htons(10000); // 摄像头的端口号
+
+    if (bind(device_sid, (struct sockaddr *)&ipv4_device, sizeof(ipv4_device)) < 0)
+    {
+        perror("设备端口绑定失败");
+        return -1;
+    }
+
+    if (bind(camera_sid, (struct sockaddr *)&ipv4_camera, sizeof(ipv4_camera)) < 0)
+    {
+        perror("摄像头端口绑定失败");
+        return -1;
+    }
+
+    listen(device_sid, 5);
+    printf("设备连接成功\n");
+    listen(camera_sid, 5);
+    printf("摄像头连接成功\n");
+
+    if (Device_Open() != 0)
+    {
+        printf("打开失败\n");
+        return -1;
+    }
+    int pid_device = fork(), pid_camera = -1;
+
+    if (pid_device == 0) // 新进程判断（处理设备状态）
+    {
+        while (1)
+        {
+            int cid = accept(device_sid, NULL, NULL);
+            if (cid < 0)
+            {
+                perror("接受失败");
+                continue;
+            }
+            handle_device(cid);
+            close(cid);
+        }
+    }
+    else if (pid_device > 0) // 原进程判断（处理摄像头）
+    {
+        int fd = open("/dev/video0", O_RDWR);
+        if (fd < 0)
+        {
+            perror("没有摄像头");
+            return 0;
+        }
+        Camera_Init(fd);
+        pid_camera = fork();
+
+        if (pid_camera == 0)
+        {
+            while (1)
+            {
+                int cid = accept(camera_sid, NULL, NULL);
+                if (cid < 0)
+                {
+                    perror("接受失败");
+                    continue;
+                }
+                Camera_t *Camera;
+                while (1)
+                {
+                    Camera = Camera_Read(fd);
+                    char buf[10];
+                    sprintf(buf, "%d", Camera->length);
+                    write(cid, buf, 10);
+                    write(cid, Camera->start, Camera->length);
+                    Camera_Write(fd);
+                }
+            }
+        }
+        else if (pid_camera > 0)
+        {
+            sleep(2);
+        }
+    }
+
+    return 0;
+}
+
+void handle_device(int cid)
+{
+    char buf[200];
+    int len = 0;
+    char Ds18b20_Date[2];
+
+    while (1)
+    {
+        memset(buf, 0, 200);
+        len = read(cid, buf, 200);
+        if (len <= 0)
+        {
+            printf("");
+            _exit(0);
+        }
+        if (buf[0] == 0xAA)
+        {
+            switch (buf[1])
+            {
+            case 0xB1:
+                if (buf[3] != 0)
+                    write(LED_fs[buf[2]], "0", 1);
+                else
+                    write(LED_fs[buf[2]], "1", 1);
+                break;
+            case 0xB2:
+                switch (buf[2])
+                {
+                case 0x00:
+                    if (buf[3] == 0)
+                        write(BEEP_fd[0], "0", 1);
+                    else
+                        write(BEEP_fd[0], "1", 1);
+                    break;
+                    break;
+
+                case 0x01:
+                    write(BEEP_fd[1], &buf[3], 20);
+                    break;
+                }
+                break;
+            case 0xB3:
+                read(DS18B20_fd, Ds18b20_Date, 2);
+                char buf_temp[20] = {0xBB, 0};
+                sprintf(&buf_temp[1], "%d.%d", Ds18b20_Date[0], Ds18b20_Date[1]); //
+                write(cid, buf_temp, 20);
+                break;
+            }
+        }
+    }
+}
+
+int Device_Open()
+{
+    const char *LEDFileNmae[3] = {
+        "/sys/class/leds/led1/brightness",
+        "/sys/class/leds/led2/brightness",
+        "/sys/class/leds/led3/brightness"};
+    for (int i = 0; i < 3; i++)
+    {
+        LED_fs[i] = open(LEDFileNmae[i], O_RDWR);
+        if (LED_fs[i] < 0)
+        {
+            perror("LED打开失败\n");
+            return -1;
+        }
+    }
+
+    const char *BEEPFileName[2] = {
+        "/sys/devices/platform/fs6818-beep/state",
+        "/sys/devices/platform/pwm/pwm.2"};
+    for (int i = 0; i < 2; i++)
+    {
+        BEEP_fd[i] = open(BEEPFileName[i], O_RDWR);
+        if (BEEP_fd[i] < 0)
+        {
+            perror("BEEP打开失败\n");
+            return -2;
+        }
+    }
+
+    const char *DS18b20FileName = "/dev/ds18b20";
+    DS18B20_fd = open(DS18b20FileName, O_RDWR);
+    if (DS18B20_fd < 0)
+    {
+        perror("DS18B20温度传感器打开失败\n");
+        return -3;
+    }
+    return 0;
+}
